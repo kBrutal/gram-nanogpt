@@ -17,6 +17,7 @@ import torch
 from gram.model import GPT, GPTConfig
 
 BYTE_VOCAB = 256  # ponytail: byte-level tokens until the shared BPE tokenizer (step 7)
+NON_CLI = ("vocab_size", "bias", "aux")  # GPTConfig fields not exposed as int CLI flags
 
 
 def pick_device(name: str = "auto") -> str:
@@ -89,7 +90,7 @@ def parse_args(argv=None):
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1337)
     for f in fields(GPTConfig):  # model dims: --n-layer, --n-embd, ...
-        if f.name not in ("vocab_size", "bias"):
+        if f.name not in NON_CLI:
             p.add_argument("--" + f.name.replace("_", "-"), type=int, default=f.default)
     return p.parse_args(argv)
 
@@ -106,7 +107,7 @@ def main(argv=None) -> dict:
     train_data, val_data = data[:n], data[n:]
 
     cfg = GPTConfig(vocab_size=BYTE_VOCAB, **{f.name: getattr(args, f.name) for f in fields(GPTConfig)
-                                              if f.name not in ("vocab_size", "bias")})
+                                              if f.name not in NON_CLI})
     model = GPT(cfg).to(device)
     opt = make_optimizer(model.parameters(), args.lr, args.weight_decay)
     (out / "config.json").write_text(json.dumps({"args": vars(args), "model": asdict(cfg), "device": device,

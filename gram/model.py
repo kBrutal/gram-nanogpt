@@ -1,7 +1,8 @@
-"""Decoder-only Transformer (GPT-2 style, pre-norm). Baseline for GRAM.
+"""Decoder-only Transformer (GPT-2 style, pre-norm) with GRAM MLPs.
 
-GRAM (step 4) replaces Block.mlp; everything else stays identical so the
-baseline and GRAM differ only in the MLP.
+Every block's MLP is a GRAMMLP: core(x) + sum of active auxiliary MLPs.
+With aux=() it is exactly a standard MLP, so the baseline and GRAM share
+all code and differ only in which auxiliaries exist and are active.
 """
 import math
 from dataclasses import dataclass
@@ -20,6 +21,17 @@ class GPTConfig:
     n_embd: int = 256
     d_ff: int = 1024  # core MLP hidden dim
     bias: bool = True
+    aux: tuple[str, ...] = ()  # auxiliary module names, e.g. ("python", "sql"); () = baseline
+    d_aux: int = 128  # auxiliary MLP hidden dim
+
+
+GRAM_AUX = ("python", "sql")
+PROFILES = {  # plan §3.4 inference profiles -> active auxiliaries
+    "full": ("python", "sql"),
+    "core": (),
+    "python": ("python",),
+    "sql": ("sql",),
+}
 
 
 class CausalSelfAttention(nn.Module):
@@ -48,17 +60,38 @@ class MLP(nn.Module):
         return self.proj(F.gelu(self.fc(x)))
 
 
+class GRAMMLP(nn.Module):
+    """core(x) + sum_{k in active} aux[k](x).
+
+    Inactive branches are skipped, not multiplied by 0: they contribute nothing
+    to the output and get grad=None, so "absent" and "present but inactive" are
+    the same computation.
+    """
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.core = MLP(cfg.n_embd, cfg.d_ff, cfg.bias)
+        self.aux = nn.ModuleDict({k: MLP(cfg.n_embd, cfg.d_aux, cfg.bias) for k in cfg.aux})
+
+    def forward(self, x, active: frozenset = frozenset()):
+        out = self.core(x)
+        for name, branch in self.aux.items():  # fixed order -> deterministic summation
+            if name in active:
+                out = out + branch(x)
+        return out
+
+
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.ln1 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
         self.attn = CausalSelfAttention(cfg)
         self.ln2 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
-        self.mlp = MLP(cfg.n_embd, cfg.d_ff, cfg.bias)
+        self.mlp = GRAMMLP(cfg)
 
-    def forward(self, x):
+    def forward(self, x, active: frozenset = frozenset()):
         x = x + self.attn(self.ln1(x))
-        return x + self.mlp(self.ln2(x))
+        return x + self.mlp(self.ln2(x), active)
 
 
 class GPT(nn.Module):
@@ -77,6 +110,29 @@ class GPT(nn.Module):
         for name, p in self.named_parameters():
             if name.endswith("proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+        self.set_profile(cfg.aux)  # default: every auxiliary active (full access)
+
+    def set_profile(self, active) -> None:
+        """Choose active auxiliaries: a PROFILES key ("full", "core", ...) or an iterable of aux names.
+        Changes no weights; one model-level set is used by every layer."""
+        if isinstance(active, str):
+            active = PROFILES[active]
+        active = frozenset(active)
+        unknown = active - set(self.cfg.aux)
+        if unknown:
+            raise ValueError(f"unknown auxiliary modules {sorted(unknown)}; model has {list(self.cfg.aux)}")
+        self.active = active
+
+    def param_groups(self) -> dict[str, list[nn.Parameter]]:
+        """Partition parameters into "core" (embeddings, attention, LayerNorms, core MLPs,
+        final norm, tied head) and one group per auxiliary (its MLP in every layer)."""
+        groups = {"core": [], **{k: [] for k in self.cfg.aux}}
+        for name, p in self.named_parameters():  # tied head appears once, as wte.weight
+            parts = name.split(".")
+            owner = parts[4] if parts[2:4] == ["mlp", "aux"] else "core"  # blocks.{i}.mlp.aux.{k}.…
+            groups[owner].append(p)
+        assert sum(map(len, groups.values())) == len(list(self.parameters()))
+        return groups
 
     @staticmethod
     def _init_weights(m):
@@ -94,7 +150,7 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=idx.device)
         x = self.wte(idx) + self.wpe(pos)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, self.active)
         logits = self.lm_head(self.ln_f(x))
         loss = None
         if targets is not None:
