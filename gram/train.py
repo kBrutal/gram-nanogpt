@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 
 from gram.model import GPT, GPTConfig
+from gram.routing import make_optimizer
 
 BYTE_VOCAB = 256  # ponytail: byte-level tokens until the shared BPE tokenizer (step 7)
 NON_CLI = ("vocab_size", "bias", "aux")  # GPTConfig fields not exposed as int CLI flags
@@ -26,16 +27,6 @@ def pick_device(name: str = "auto") -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "mps" if torch.backends.mps.is_available() else "cpu"
-
-
-def make_optimizer(params, lr: float, weight_decay: float):
-    """AdamW with decay on matrices/embeddings only (not biases or LayerNorm), as in nanoGPT."""
-    params = [p for p in params if p.requires_grad]
-    groups = [
-        {"params": [p for p in params if p.dim() >= 2], "weight_decay": weight_decay},
-        {"params": [p for p in params if p.dim() < 2], "weight_decay": 0.0},
-    ]
-    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95))
 
 
 def lr_at(step: int, max_lr: float, warmup: int, total: int, min_ratio: float = 0.1) -> float:
