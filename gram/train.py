@@ -134,6 +134,8 @@ def main(argv=None) -> dict:
         session = {k: getattr(args, k) for k in ("resume", "device", "stop_after")}
         args = argparse.Namespace(**{**resume["args"], **session})
     device = pick_device(args.device)
+    if device == "cuda":  # TF32 matmuls on Ampere+ (A100/L4): near-fp32 accuracy, several times faster
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     data_dir, out = Path(args.data_dir), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
