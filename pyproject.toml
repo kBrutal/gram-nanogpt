@@ -3,7 +3,12 @@ name = "gram"
 version = "0.1.0"
 description = "Gradient-Routed Auxiliary Modules: capability access control in small LMs"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.2", "numpy"]
+dependencies = [
+    "torch>=2.2",
+    "numpy",
+    "tokenizers>=0.15",
+    "pyarrow>=15",  # with numpy<2 (e.g. torch 2.2 on macOS) use pyarrow<20
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
