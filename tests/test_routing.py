@@ -130,3 +130,24 @@ def test_baseline_single_optimizer():
     model, router, optim = setup(cfg=replace(CFG, aux=()))
     rec = train_step(model, router, optim, *batch(), "python")
     assert rec["stepped"] == ["core"] and set(optim.opts) == {"core"}
+
+
+def test_cross_activation_variant_is_forward_only():
+    model, router, optim = setup(p_as=0.0, lr=1.0, wd=1.0)
+    router.p_xa = 1.0
+    before = snapshot(model)
+    for s in range(5):
+        rec = train_step(model, router, optim, *batch(s), "python", log=True)
+        assert rec["active"] == ["python", "sql"] and rec["stepped"] == ["python"]
+        assert rec["grad_norm"]["sql"] > 0 and rec["delta"]["sql"] == 0.0  # in the graph, never stepped
+    assert changed(before, model) == {"core": False, "python": True, "sql": False}
+    assert optim.opts["sql"].state == {}
+
+
+def test_cross_activation_frequency_and_default_stream():
+    r = Router(GRAM_AUX, 0.3, 0.5, seed=0, p_xa=0.5)
+    acts = Counter(r.route("sql")[0] for _ in range(20_000))
+    assert set(acts) == {("sql",), ("python", "sql")} and abs(acts[("python", "sql")] / 20_000 - 0.5) < 0.02
+    a, b = Router(GRAM_AUX, 0.3, 0.5, seed=0), Router(GRAM_AUX, 0.3, 0.5, seed=0, p_xa=0.0)
+    seq = ["core", "python", "sql"] * 100
+    assert [a.route(d) for d in seq] == [b.route(d) for d in seq]  # p_xa=0 leaves the random stream untouched
