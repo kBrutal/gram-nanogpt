@@ -1,24 +1,32 @@
-"""Training loop.
+"""Domain-routed training (plan §6).
 
-Step 3 scope: single-domain, byte-level sanity run (train -> checkpoint -> reload -> generate).
-Domain-labelled batches, gradient routing and per-group optimizers arrive in steps 5-6.
+Data layout (produced by the step-7 pipeline, or by hand for toy runs):
+    <data-dir>/meta.json             {"vocab_size": int, "domains": [...], + tokenizer/dataset identifiers}
+    <data-dir>/<domain>_<split>.bin  uint16 token ids; split in {train, val}
 
-    python -m gram.train --data data/raw/tinyshakespeare.txt --out runs/sanity
+    python -m gram.train --data-dir data/processed --out runs/gram_s0                        # GRAM
+    python -m gram.train --data-dir data/processed --arch standard --out runs/std_s0         # Baseline A
+    python -m gram.train --data-dir data/processed --arch standard --domains core,sql ...    # Baseline B (no Python)
+    python -m gram.train --resume runs/gram_s0/ckpt.pt                                       # continue a run
 """
 import argparse
 import json
 import math
+import os
+import platform
+import subprocess
 import time
-from dataclasses import asdict, fields
+from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import torch
 
-from gram.model import GPT, GPTConfig
-from gram.routing import make_optimizer
+from gram.model import GPT, GPTConfig, profiles
+from gram.routing import OptimizerManager, Router, train_step
 
-BYTE_VOCAB = 256  # ponytail: byte-level tokens until the shared BPE tokenizer (step 7)
-NON_CLI = ("vocab_size", "bias", "aux")  # GPTConfig fields not exposed as int CLI flags
+MODEL_FLAGS = ("block_size", "n_layer", "n_head", "n_embd", "d_ff", "d_aux")
 
 
 def pick_device(name: str = "auto") -> str:
@@ -37,28 +45,50 @@ def lr_at(step: int, max_lr: float, warmup: int, total: int, min_ratio: float = 
     return max_lr * (min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
-def get_batch(data: torch.Tensor, batch_size: int, block_size: int, device: str, gen: torch.Generator):
-    ix = torch.randint(len(data) - block_size - 1, (batch_size,), generator=gen)
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    return x.to(device), y.to(device)
+def load_split(data_dir: Path, domains, split: str, block_size: int) -> dict[str, np.memmap]:
+    out = {}
+    for d in domains:
+        arr = np.memmap(data_dir / f"{d}_{split}.bin", dtype=np.uint16, mode="r")
+        if len(arr) <= block_size + 1:
+            raise ValueError(f"{d}_{split}.bin has {len(arr)} tokens; need more than block_size+1={block_size + 1}")
+        out[d] = arr
+    return out
+
+
+def get_batch(arr, batch_size: int, block_size: int, device: str, gen: torch.Generator):
+    ix = torch.randint(len(arr) - block_size - 1, (batch_size,), generator=gen).tolist()
+    chunk = torch.from_numpy(np.stack([arr[i : i + block_size + 1] for i in ix]).astype(np.int64))
+    return chunk[:, :-1].to(device), chunk[:, 1:].to(device)
 
 
 @torch.no_grad()
-def estimate_loss(model, data, args, device, gen) -> float:
+def eval_matrix(model, val: dict, batch_size: int, block_size: int, iters: int, device: str, seed: int) -> dict:
+    """Validation loss for every profile x domain. Every cell sees the same batches for its domain."""
     model.eval()
-    losses = [model(*get_batch(data, args.batch_size, args.block_size, device, gen))[1].item()
-              for _ in range(args.eval_iters)]
+    out = {}
+    for name, active in profiles(model.cfg.aux).items():
+        model.set_profile(active)
+        out[name] = {}
+        for d, arr in val.items():
+            gen = torch.Generator().manual_seed(seed)
+            out[name][d] = sum(model(*get_batch(arr, batch_size, block_size, device, gen))[1].item()
+                               for _ in range(iters)) / iters
     model.train()
-    return sum(losses) / len(losses)
+    return out
 
 
-def save_checkpoint(path: Path, model, optimizer, cfg: GPTConfig, step: int, metrics: dict):
-    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                "config": asdict(cfg), "step": step, "metrics": metrics}, path)
+def git_commit() -> str:
+    try:
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True).stdout.strip()
+        return sha + ("-dirty" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def load_checkpoint(path, device: str = "cpu"):
+    """-> (model in eval mode, full checkpoint dict). For evaluation scripts."""
     ckpt = torch.load(path, map_location=device)
     model = GPT(GPTConfig(**ckpt["config"]))
     model.load_state_dict(ckpt["model"])
@@ -67,75 +97,131 @@ def load_checkpoint(path, device: str = "cpu"):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--data", required=True, help="plain-text file")
-    p.add_argument("--out", default="runs/sanity")
-    p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--data-dir", help="directory with meta.json and <domain>_<split>.bin")
+    p.add_argument("--out", default="runs/default")
+    p.add_argument("--resume", help="checkpoint to continue from (its saved settings are reused)")
+    p.add_argument("--arch", choices=("gram", "standard"), default="gram")
+    p.add_argument("--domains", default="core,python,sql", help="training domains; 'core' required")
+    p.add_argument("--mix", default="", help="domain sampling weights, e.g. core=0.6,python=0.2,sql=0.2 "
+                                             "(default: equal); this is where p_af is applied")
+    p.add_argument("--p-as", type=float, default=0.3, help="P(core group updates) on an auxiliary batch")
+    p.add_argument("--p-cr", type=float, default=0.5, help="P(one auxiliary active) on a core batch")
+    p.add_argument("--steps", type=int, default=10_000)
+    p.add_argument("--stop-after", type=int, default=0, help="save and exit after N steps this session (0 = off)")
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--warmup", type=int, default=100)
+    p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--eval-every", type=int, default=250)
+    p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-iters", type=int, default=20)
-    p.add_argument("--sample-tokens", type=int, default=300)
+    p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--device", default="auto")
-    p.add_argument("--seed", type=int, default=1337)
-    for f in fields(GPTConfig):  # model dims: --n-layer, --n-embd, ...
-        if f.name not in NON_CLI:
-            p.add_argument("--" + f.name.replace("_", "-"), type=int, default=f.default)
-    return p.parse_args(argv)
+    p.add_argument("--seed", type=int, default=0)
+    defaults = GPTConfig()
+    for f in MODEL_FLAGS:
+        p.add_argument("--" + f.replace("_", "-"), type=int, default=getattr(defaults, f))
+    args = p.parse_args(argv)
+    if not args.resume and not args.data_dir:
+        p.error("--data-dir is required unless --resume is given")
+    return args
 
 
 def main(argv=None) -> dict:
     args = parse_args(argv)
+    resume = torch.load(args.resume, map_location="cpu") if args.resume else None
+    if resume:  # reuse the run's settings; only session-level flags may change
+        session = {k: getattr(args, k) for k in ("resume", "device", "stop_after")}
+        args = argparse.Namespace(**{**resume["args"], **session})
     device = pick_device(args.device)
-    torch.manual_seed(args.seed)
-    out = Path(args.out)
+    data_dir, out = Path(args.data_dir), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    data = torch.frombuffer(bytearray(Path(args.data).read_bytes()), dtype=torch.uint8).long()
-    n = int(0.9 * len(data))
-    train_data, val_data = data[:n], data[n:]
+    meta = json.loads((data_dir / "meta.json").read_text())
+    domains = args.domains.split(",")
+    assert "core" in domains, "GRAM and the baselines always train the core domain"
+    aux = tuple(d for d in domains if d != "core") if args.arch == "gram" else ()
+    cfg = GPTConfig(vocab_size=meta["vocab_size"], aux=aux, **{f: getattr(args, f) for f in MODEL_FLAGS})
+    train = load_split(data_dir, domains, "train", cfg.block_size)
+    val = load_split(data_dir, meta["domains"], "val", cfg.block_size)  # evaluate held-out domains too
 
-    cfg = GPTConfig(vocab_size=BYTE_VOCAB, **{f.name: getattr(args, f.name) for f in fields(GPTConfig)
-                                              if f.name not in NON_CLI})
+    mix = dict.fromkeys(domains, 1.0)
+    for part in filter(None, args.mix.split(",")):
+        k, v = part.split("=")
+        assert k in mix, f"--mix domain {k!r} not in --domains"
+        mix[k] = float(v)
+    weights = torch.tensor([mix[d] for d in domains])
+
+    torch.manual_seed(args.seed)
     model = GPT(cfg).to(device)
-    opt = make_optimizer(model.parameters(), args.lr, args.weight_decay)
-    (out / "config.json").write_text(json.dumps({"args": vars(args), "model": asdict(cfg), "device": device,
-                                                 "torch": torch.__version__, "params": model.num_params()}, indent=2))
-    print(f"device={device} params={model.num_params():,} train_tokens={len(train_data):,}")
+    # Distinct seeds: same-seeded generators would produce identical streams and correlate
+    # domain sampling with routing decisions.
+    router = Router(aux, args.p_as, args.p_cr, seed=args.seed + 1)
+    data_gen = torch.Generator().manual_seed(args.seed + 2)
+    eval_seed = args.seed + 3
+    optim = OptimizerManager(model.param_groups(), args.lr, args.weight_decay)
+    stats = {"tokens": Counter(), "batches": Counter(), "routes": Counter()}
+    start = 0
+    if resume:
+        model.load_state_dict(resume["model"])
+        optim.load_state_dict(resume["optim"])
+        router.load_state_dict(resume["router"])
+        data_gen.set_state(resume["rng"]["data"])
+        torch.set_rng_state(resume["rng"]["torch"])
+        stats = {k: Counter(v) for k, v in resume["stats"].items()}
+        start = resume["step"]
+    else:
+        (out / "config.json").write_text(json.dumps({
+            "args": vars(args), "model": asdict(cfg), "meta": meta, "mix": mix, "device": device,
+            "params": {k: sum(p.numel() for p in ps) for k, ps in model.param_groups().items()},
+            "params_total": model.num_params(), "git": git_commit(), "torch": torch.__version__,
+            "python": platform.python_version(), "platform": platform.platform()}, indent=2))
 
-    batch_gen = torch.Generator().manual_seed(args.seed)
-    eval_gen = lambda: torch.Generator().manual_seed(args.seed + 1)  # same val batches every eval
-    history, log = [], open(out / "metrics.jsonl", "w")
-    t0 = time.time()
-    for step in range(args.steps + 1):
-        if step % args.eval_every == 0 or step == args.steps:
-            val = estimate_loss(model, val_data, args, device, eval_gen())
-            rec = {"step": step, "val_loss": val, "elapsed_s": round(time.time() - t0, 1)}
-            history.append(rec)
-            log.write(json.dumps(rec) + "\n"); log.flush()
-            print(f"step {step:5d} | val {val:.4f} | {rec['elapsed_s']}s")
-            save_checkpoint(out / "ckpt.pt", model, opt, cfg, step, rec)
+    def save(step, last_eval):
+        ckpt = {"model": model.state_dict(), "optim": optim.state_dict(), "router": router.state_dict(),
+                "rng": {"data": data_gen.get_state(), "torch": torch.get_rng_state()},
+                "step": step, "stats": {k: dict(v) for k, v in stats.items()}, "args": vars(args),
+                "config": asdict(cfg), "meta": meta, "eval": last_eval}
+        torch.save(ckpt, out / "ckpt.pt.tmp")
+        os.replace(out / "ckpt.pt.tmp", out / "ckpt.pt")  # atomic: a killed session never leaves a torn file
+
+    mode = "a" if resume else "w"
+    train_log, eval_log = open(out / "train.jsonl", mode), open(out / "eval.jsonl", mode)
+    print(f"device={device} arch={args.arch} aux={list(aux)} params={model.num_params():,} start={start}")
+    history, last_eval, t0 = [], None, time.time()
+    step = start
+    while True:
+        if (step % args.eval_every == 0 or step == args.steps) and not (resume and step == start):
+            em = eval_matrix(model, val, args.batch_size, cfg.block_size, args.eval_iters, device, eval_seed)
+            last_eval = {"step": step, "tokens": dict(stats["tokens"]), "updates": dict(optim.updates),
+                         "val": em, "elapsed_s": round(time.time() - t0, 1)}
+            history.append(last_eval)
+            eval_log.write(json.dumps(last_eval) + "\n"); eval_log.flush()
+            cells = "  ".join(f"{p}[" + " ".join(f"{d}={v:.3f}" for d, v in row.items()) + "]" for p, row in em.items())
+            print(f"step {step:6d} | {cells} | {last_eval['elapsed_s']}s", flush=True)
+            save(step, last_eval)
         if step == args.steps:
             break
-        for g in opt.param_groups:
-            g["lr"] = lr_at(step, args.lr, args.warmup, args.steps)
-        _, loss = model(*get_batch(train_data, args.batch_size, cfg.block_size, device, batch_gen))
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        opt.step()
-    log.close()
+        if args.stop_after and step - start == args.stop_after:
+            save(step, last_eval)
+            print(f"stopped at step {step}; resume with --resume {out / 'ckpt.pt'}")
+            break
 
-    # Prove the checkpoint round-trips: fresh model from disk, same val loss, then generate.
-    reloaded, _ = load_checkpoint(out / "ckpt.pt", device)
-    reloaded_val = estimate_loss(reloaded, val_data, args, device, eval_gen())
-    prompt = torch.tensor([[ord("\n")]], device=device)
-    sample = bytes(reloaded.generate(prompt, args.sample_tokens, top_k=20)[0].tolist()).decode("utf-8", "replace")
-    (out / "sample.txt").write_text(sample)
-    print(f"reloaded val {reloaded_val:.4f}\n--- sample ---{sample}\n--------------")
-    return {"history": history, "reloaded_val": reloaded_val, "sample": sample}
+        domain = domains[int(torch.multinomial(weights, 1, generator=data_gen))]
+        x, y = get_batch(train[domain], args.batch_size, cfg.block_size, device, data_gen)
+        lr = lr_at(step, args.lr, args.warmup, args.steps)
+        optim.set_lr(lr)
+        log = step % args.log_every == 0
+        rec = train_step(model, router, optim, x, y, domain, args.grad_clip, log)
+        stats["tokens"][domain] += x.numel()
+        stats["batches"][domain] += 1
+        stats["routes"][f"{domain}|active={'+'.join(rec['active']) or '-'}|step={'+'.join(rec['stepped'])}"] += 1
+        if log:
+            rec.update(step=step, lr=lr, loss=rec["loss"].item(), updates=dict(optim.updates))
+            train_log.write(json.dumps(rec) + "\n")
+        step += 1
+    train_log.close(); eval_log.close()
+    return {"eval": history, "stats": stats, "updates": dict(optim.updates), "model": model}
 
 
 if __name__ == "__main__":

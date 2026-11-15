@@ -26,12 +26,19 @@ class GPTConfig:
 
 
 GRAM_AUX = ("python", "sql")
-PROFILES = {  # plan §3.4 inference profiles -> active auxiliaries
-    "full": ("python", "sql"),
-    "core": (),
-    "python": ("python",),
-    "sql": ("sql",),
-}
+
+
+def profiles(aux) -> dict[str, tuple[str, ...]]:
+    """Inference profiles (plan §3.4) -> active auxiliaries: full, core-only, and each aux alone.
+    Duplicates collapse, e.g. a baseline (aux=()) has only "full"."""
+    out = {"full": tuple(aux)}
+    for name, active in [("core", ()), *((k, (k,)) for k in aux)]:
+        if active not in out.values():
+            out[name] = active
+    return out
+
+
+PROFILES = profiles(GRAM_AUX)  # {"full": (python, sql), "core": (), "python": (python,), "sql": (sql,)}
 
 
 class CausalSelfAttention(nn.Module):
@@ -116,7 +123,10 @@ class GPT(nn.Module):
         """Choose active auxiliaries: a PROFILES key ("full", "core", ...) or an iterable of aux names.
         Changes no weights; one model-level set is used by every layer."""
         if isinstance(active, str):
-            active = PROFILES[active]
+            named = profiles(self.cfg.aux)
+            if active not in named:
+                raise ValueError(f"unknown profile {active!r}; model has {list(named)}")
+            active = named[active]
         active = frozenset(active)
         unknown = active - set(self.cfg.aux)
         if unknown:
