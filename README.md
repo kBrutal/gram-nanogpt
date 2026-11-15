@@ -18,7 +18,6 @@ An independent, small-scale implementation inspired by *Modular Pretraining Enab
 - [Evaluation](#evaluation)
 - [Results so far](#results-so-far)
 - [Tests](#tests)
-- [Status and roadmap](#status-and-roadmap)
 
 ## How it works
 
@@ -300,24 +299,3 @@ The 44 tests check these properties:
   trainer.
 - **Evaluation:** window losses equal the model's loss; the derived-metric arithmetic is right; evaluation never
   changes weights; a tokenizer mismatch is refused.
-
-## Status and roadmap
-
-**Done:**
-- The model and inference profiles.
-- Gradient routing.
-- The trainer with resume.
-- The data pipeline.
-- The Colab workflow.
-- Evaluation part 1 (loss matrix and suppression/leakage metrics).
-- The `p_xa` variant and the `--xa-freeze-core` ablation.
-
-**Next:**
-- [ ] The `gram_xa50fc_s0` and `gram_s1` runs.
-- [ ] Evaluation part 2: SQL execution accuracy in a throwaway in-memory SQLite, and the syntax validity of generated
-  Python.
-- [ ] Baselines: parameter-matched standard model; data-filtered model (no Python); post-hoc unlearning via gradient
-  difference.
-- [ ] Recovery experiments: fine-tuning a suppressed model to see how quickly the capability returns.
-- [ ] Sensitivity sweeps over `p_as`, `p_cr` and `d_aux`; multiple seeds.
-- [ ] Figures and write-up.
