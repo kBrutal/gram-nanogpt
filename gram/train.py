@@ -108,6 +108,8 @@ def parse_args(argv=None):
     p.add_argument("--p-cr", type=float, default=0.5, help="P(one auxiliary active) on a core batch")
     p.add_argument("--p-xa", type=float, default=0.0, help="variant: P(each other auxiliary co-active, "
                                                            "forward only, never stepped) on an auxiliary batch")
+    p.add_argument("--xa-freeze-core", action="store_true", help="ablation: never step the core on a batch "
+                                                                 "with a co-active auxiliary (needs --p-xa)")
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--stop-after", type=int, default=0, help="save and exit after N steps this session (0 = off)")
     p.add_argument("--batch-size", type=int, default=64)
@@ -161,7 +163,8 @@ def main(argv=None) -> dict:
     model = GPT(cfg).to(device)
     # Distinct seeds: same-seeded generators would produce identical streams and correlate
     # domain sampling with routing decisions.
-    router = Router(aux, args.p_as, args.p_cr, seed=args.seed + 1, p_xa=args.p_xa)
+    router = Router(aux, args.p_as, args.p_cr, seed=args.seed + 1, p_xa=args.p_xa,
+                    xa_freeze_core=args.xa_freeze_core)
     data_gen = torch.Generator().manual_seed(args.seed + 2)
     eval_seed = args.seed + 3
     optim = OptimizerManager(model.param_groups(), args.lr, args.weight_decay)

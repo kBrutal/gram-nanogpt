@@ -12,6 +12,8 @@ so its weights and AdamW state (incl. weight decay) do not change.
 p_xa (variant, default 0 = plan §4): co-activating the other auxiliaries on an aux batch
 teaches the core and aux k to tolerate them, so the full-access profile is in-distribution.
 The co-active auxiliaries are never stepped, so they still never learn from domain k.
+xa_freeze_core (ablation): never step the core on a batch with a co-active auxiliary, so only
+aux k can adapt to it. Same random draws as without it, so routes match the p_xa run exactly.
 """
 import torch
 from torch import nn
@@ -30,9 +32,11 @@ def make_optimizer(params, lr: float, weight_decay: float):
 class Router:
     """Samples routing decisions from its own generator so they are reproducible and resumable."""
 
-    def __init__(self, aux, p_as: float, p_cr: float, seed: int = 0, p_xa: float = 0.0):
+    def __init__(self, aux, p_as: float, p_cr: float, seed: int = 0, p_xa: float = 0.0,
+                 xa_freeze_core: bool = False):
         assert all(0.0 <= p <= 1.0 for p in (p_as, p_cr, p_xa))
         self.aux, self.p_as, self.p_cr, self.p_xa = tuple(aux), p_as, p_cr, p_xa
+        self.xa_freeze_core = xa_freeze_core
         self.gen = torch.Generator().manual_seed(seed)
 
     def _uniform(self) -> float:
@@ -52,6 +56,8 @@ class Router:
         stepped = ("core", domain) if self._uniform() < self.p_as else (domain,)
         # No draws when p_xa == 0, so plan-§4 runs keep exactly the same random stream.
         co_active = {k for k in self.aux if k != domain and self.p_xa > 0 and self._uniform() < self.p_xa}
+        if co_active and self.xa_freeze_core:
+            stepped = (domain,)
         return tuple(k for k in self.aux if k == domain or k in co_active), stepped
 
     def state_dict(self) -> dict:

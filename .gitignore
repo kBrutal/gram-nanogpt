@@ -5,3 +5,4 @@ runs/
 data/
 .pytest_cache/
 dist/
+.DS_Store

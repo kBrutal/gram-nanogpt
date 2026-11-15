@@ -151,3 +151,19 @@ def test_cross_activation_frequency_and_default_stream():
     a, b = Router(GRAM_AUX, 0.3, 0.5, seed=0), Router(GRAM_AUX, 0.3, 0.5, seed=0, p_xa=0.0)
     seq = ["core", "python", "sql"] * 100
     assert [a.route(d) for d in seq] == [b.route(d) for d in seq]  # p_xa=0 leaves the random stream untouched
+
+
+def test_xa_freeze_core_only_drops_core_steps_on_co_active_batches():
+    a = Router(GRAM_AUX, 0.3, 0.5, seed=0, p_xa=0.5)
+    b = Router(GRAM_AUX, 0.3, 0.5, seed=0, p_xa=0.5, xa_freeze_core=True)
+    seq = ["core", "python", "sql"] * 2000
+    n_dropped = 0
+    for d in seq:
+        (act_a, st_a), (act_b, st_b) = a.route(d), b.route(d)
+        assert act_a == act_b  # same random draws: identical activations
+        if d != "core" and len(act_b) > 1:
+            assert st_b == (d,)  # core frozen whenever another aux is co-active
+            n_dropped += "core" in st_a
+        else:
+            assert st_b == st_a
+    assert n_dropped > 0
